@@ -1,0 +1,496 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Wind turbine streaming PoC (Kinesis + Lambda + Firehose + S3)
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: turbine-vpc
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: turbine-private-a
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+       - Key: Name
+         Value: turbine-private-b
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: turbine-private-rt
+  SubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+  SubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+  EndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kinesis Endpoint, accepts HTTPS from producer and lambda
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: sg-endpoint
+  ProducerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Producer, may only call the Kinesis endpoint over HTTPS
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: sg-producer
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda, may only call the kinesis endpoint over HTTPS
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          DestinationSecurityGroupId: !Ref EndpointSecurityGroup
+      Tags:
+        - Key: Name
+          Value: sg-lambda
+  EndpointIngressFromProducer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ProducerSecurityGroup
+      Description: HTTPS from the producer
+  EndpointIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: HTTPS from Lambda
+  KinesisInterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.kinesis-streams
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds:
+        - !Ref EndpointSecurityGroup
+      PrivateDnsEnabled: true
+  DataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encrypts the turbine stream and the data lake bucket
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: turbine-key
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/turbine-poc
+      TargetKeyId: !Ref DataKey
+  TurbineStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: turbine-readings
+      RetentionPeriodHours: 24
+      StreamModeDetails:
+        StreamMode: PROVISIONED
+      ShardCount: 1
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: !GetAtt DataKey.Arn
+      Tags:
+        - Key: Name
+          Value: turbine-readings
+  # ---------------------------------------------------------------
+  # Step 9: S3 data lake bucket (where Firehose writes turbine files)
+  # Well-Architected: SEC08-BP02 (encrypt at rest), SEC08-BP04 (access control)
+  # ---------------------------------------------------------------
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # Bucket names are unique across ALL of AWS, so we add account ID and Region
+      BucketName: !Sub turbine-poc-lake-${AWS::AccountId}-${AWS::Region}
+
+      # Encrypt every new object at rest with OUR KMS key from Step 7
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataKey.Arn
+            # Reuse a short-lived bucket-level key: fewer KMS calls, lower cost
+            BucketKeyEnabled: true
+
+      # Four switches that make it impossible to expose the bucket publicly
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true        # reject new public ACLs
+        BlockPublicPolicy: true      # reject bucket policies that grant public access
+        IgnorePublicAcls: true       # ignore any public ACL that already exists
+        RestrictPublicBuckets: true  # limit access to AWS services and authorized users
+
+      # Delete objects after 30 days so PoC data doesn't pile up and cost money
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-after-30-days
+            Status: Enabled
+            ExpirationInDays: 30
+
+      Tags:
+        - Key: Name
+          Value: turbine-data-lake
+
+  # Bucket policy: refuses any request that is not HTTPS (SEC09-BP02)
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny              # an explicit Deny always wins over any Allow
+            Principal: '*'            # applies to everyone
+            Action: s3:*              # every S3 action
+            Resource:
+              - !GetAtt DataLakeBucket.Arn          # the bucket itself
+              - !Sub ${DataLakeBucket.Arn}/*        # every object inside it
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'        # true only for plain HTTP requests
+  # ---------------------------------------------------------------
+  # Step 10: S3 gateway endpoint (EDIT the existing resource from Step 6)
+  # Well-Architected: SEC05-BP02 (control traffic at all layers, defense in depth)
+  # ---------------------------------------------------------------
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3   # S3 in the current Region
+      VpcEndpointType: Gateway                            # gateway = route table entry, free
+      RouteTableIds:
+        - !Ref PrivateRouteTable                          # AWS adds the S3 prefix-list route here
+
+      # NEW: endpoint policy. It only LIMITS access, it never grants it.
+      # Effective permission = caller's IAM policy AND this policy AND the bucket policy.
+      # Without this block the default is "allow everything", so any bucket in the world.
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOnlyOurDataLake
+            Effect: Allow
+            Principal: '*'                 # everyone going through the endpoint; IAM still decides who they are
+            Action:
+              - s3:GetObject               # read files
+              - s3:PutObject               # write files
+              - s3:ListBucket              # list the bucket contents
+              - s3:GetBucketLocation       # find the bucket's Region
+            Resource:
+              - !GetAtt DataLakeBucket.Arn         # the bucket itself (needed for ListBucket)
+              - !Sub ${DataLakeBucket.Arn}/*       # every object inside it (needed for Get/Put)
+  # ---------------------------------------------------------------
+  # Step 11: IAM role for Firehose (service role)
+  # Well-Architected: SEC03-BP02 least privilege, SEC08-BP01/BP04 key and data access
+  # ---------------------------------------------------------------
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # TRUST POLICY: who is allowed to wear this role (assume it)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com    # only the Firehose service
+            Action: sts:AssumeRole               # "put on this role"
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId   # only Firehose acting for OUR account
+
+      # PERMISSION POLICY: what the role is allowed to do once assumed
+      Policies:
+        - PolicyName: firehose-delivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # 1. Read the turbine records from the stream (Firehose is a consumer)
+              - Sid: ReadFromStream
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:GetShardIterator    # "where do I start reading in the shard"
+                  - kinesis:GetRecords          # read the records
+                  - kinesis:ListShards
+                Resource: !GetAtt TurbineStream.Arn      # only OUR stream
+
+              # 2. Write the files into the data lake bucket
+              - Sid: WriteToLake
+                Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn           # the bucket
+                  - !Sub ${DataLakeBucket.Arn}/*         # the objects inside
+
+              # 3. Use our KMS key: decrypt the stream, encrypt the S3 files
+              - Sid: UseKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt                          # read the encrypted stream
+                  - kms:GenerateDataKey                  # encrypt each file written to S3
+                Resource: !GetAtt DataKey.Arn            # only OUR key
+
+              # 4. Write delivery errors to the log group (NEW in Step 12)
+              - Sid: WriteLogs
+                Effect: Allow
+                Action: logs:PutLogEvents      # add entries to a log stream, nothing else
+                # Only streams inside OUR log group, not every log group in the account
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${FirehoseLogGroup}:log-stream:*
+  # ---------------------------------------------------------------
+  # Step 12: CloudWatch log group for Firehose delivery errors
+  # Well-Architected: OPS08 (understand workload health), cost control via retention
+  # ---------------------------------------------------------------
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # The /aws/kinesisfirehose/ prefix is the usual convention for Firehose logs
+      LogGroupName: /aws/kinesisfirehose/turbine-to-s3
+      # Default is "never expire". 7 days is plenty for a PoC and keeps cost near zero
+      RetentionInDays: 7
+
+  # Firehose writes into a log STREAM (a sequence of entries) inside the group,
+  # and the stream must already exist
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup   # Ref of a log group returns its name
+      LogStreamName: S3Delivery             # we will point Firehose at this name
+  # ---------------------------------------------------------------
+  # Step 13: Firehose delivery stream  (Kinesis stream -> S3)
+  # Consumer 2 of the architecture. No code, no servers, managed by AWS.
+  # ---------------------------------------------------------------
+  TurbineDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: turbine-to-s3
+      # Our source is an existing Kinesis stream (not direct puts to Firehose)
+      DeliveryStreamType: KinesisStreamAsSource
+
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt TurbineStream.Arn   # read from OUR stream
+        RoleARN: !GetAtt FirehoseRole.Arn             # using the role from Step 11
+
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn         # write into OUR bucket
+        RoleARN: !GetAtt FirehoseRole.Arn
+
+        # Folder layout by arrival time (UTC): turbines/2026/10/21/09/<file>
+        # Partitioned like this, Athena can later skip folders it doesn't need
+        Prefix: 'turbines/!{timestamp:yyyy}/!{timestamp:MM}/!{timestamp:dd}/!{timestamp:HH}/'
+        # Mandatory when the prefix uses timestamps: where failed records go
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/!{timestamp:yyyy}/!{timestamp:MM}/!{timestamp:dd}/'
+
+        # Collect records and write one file when EITHER limit is reached first
+        BufferingHints:
+          IntervalInSeconds: 60     # 60 seconds passed, or...
+          SizeInMBs: 1              # ...1 MB collected
+
+        # Plain text so we can read the files easily. We try GZIP in Phase 4
+        CompressionFormat: UNCOMPRESSED
+
+        # Send delivery errors to the log group from Step 12
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+  # ---------------------------------------------------------------
+  # Step 14: SQS queue for failed Lambda batches (on-failure destination)
+  # Well-Architected: REL 11 (withstand component failures), OPS08 (see problems)
+  # ---------------------------------------------------------------
+  LambdaFailureQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: turbine-lambda-failures
+      # Keep failure reports 14 days (the maximum) so there is time to investigate
+      MessageRetentionPeriod: 1209600
+      # Encrypt messages at rest with an SQS-managed key (free, no key policy work)
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Name
+          Value: turbine-lambda-failures
+  # ---------------------------------------------------------------
+  # Step 15: IAM execution role for the Lambda consumer
+  # Well-Architected: SEC03-BP02 least privilege, SEC08-BP01 (key use)
+  # ---------------------------------------------------------------
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # TRUST POLICY: only the Lambda service may assume this role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      # AWS-managed policy: lets Lambda create/delete its network interfaces (ENIs)
+      # in our subnets, and write logs. Needed because the function runs inside the VPC.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+      # OUR policy: only what this function needs, scoped to our own resources
+      Policies:
+        - PolicyName: lambda-consume-turbines
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # 1. Read the records from OUR stream
+              - Sid: ReadFromStream
+                Effect: Allow
+                Action:
+                  - kinesis:DescribeStream
+                  - kinesis:DescribeStreamSummary
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:ListShards
+                Resource: !GetAtt TurbineStream.Arn
+
+              # 2. The event source mapping also lists streams; this action
+              #    cannot be limited to one resource, so '*' is unavoidable here
+              - Sid: ListStreams
+                Effect: Allow
+                Action: kinesis:ListStreams
+                Resource: '*'
+
+              # 3. Decrypt the encrypted records ("door 2": the key policy is "door 1")
+              - Sid: DecryptStream
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt DataKey.Arn
+
+              # 4. Report failed batches to our failure queue (Step 14)
+              - Sid: ReportFailures
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt LambdaFailureQueue.Arn
+  # ---------------------------------------------------------------
+  # Step 16: Lambda function + its log group (Consumer 1: ALERT when wind > 25 m/s)
+  # Well-Architected: SEC05-BP01 (run functions in the VPC to use VPC controls, p. 155)
+  # ---------------------------------------------------------------
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      # Lambda logs go to /aws/lambda/<function name>. We create it ourselves
+      # so we can set retention (otherwise logs are kept forever)
+      LogGroupName: /aws/lambda/turbine-alert-consumer
+      RetentionInDays: 7
+
+  TurbineAlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: turbine-alert-consumer
+      Runtime: python3.12
+      Handler: index.handler          # file index.py, function handler (CloudFormation names the inline file index.py)
+      Role: !GetAtt LambdaRole.Arn    # execution role from Step 15
+      Timeout: 30                     # seconds before Lambda stops the run
+      MemorySize: 128                 # MB; CPU scales with memory. 128 is the minimum
+
+      # Run INSIDE our VPC: Lambda creates ENIs in these subnets with this firewall
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup  # sg-lambda: outbound 443 to sg-endpoint only
+
+      # Send logs to the log group we created above
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+
+      Code:
+        ZipFile: |
+          import base64
+          import json
+
+          THRESHOLD = 25  # m/s: above this the turbine should be reviewed
+
+          def handler(event, context):
+              # Lambda hands us a BATCH of records read from one shard
+              for record in event["Records"]:
+                  # Kinesis delivers each record's payload base64-encoded
+                  payload = base64.b64decode(record["kinesis"]["data"]).decode("utf-8")
+                  reading = json.loads(payload)  # trailing newline is fine for json.loads
+                  if reading["wind_speed"] > THRESHOLD:
+                      print(f"ALERT turbine={reading['turbine_id']} "
+                            f"wind_speed={reading['wind_speed']} m/s "
+                            f"at {reading['timestamp']}")
+              return {"processed": len(event["Records"])}
+  # ---------------------------------------------------------------
+  # Step 17: Event source mapping (Kinesis stream -> Lambda)
+  # Lambda POLLS the stream (pull model); nothing pushes records to the function.
+  # ---------------------------------------------------------------
+  TurbineStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref TurbineAlertFunction        # who gets the records
+      EventSourceArn: !GetAtt TurbineStream.Arn      # where they come from
+      StartingPosition: TRIM_HORIZON                 # start at the oldest record still in the stream
+      BatchSize: 100                                 # up to 100 records per invocation
+      MaximumRetryAttempts: 2                        # retry a failing batch twice, then give up
+      BisectBatchOnFunctionError: true               # split a failing batch to isolate the bad record
+      MaximumRecordAgeInSeconds: 3600                # skip records older than 1 hour
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt LambdaFailureQueue.Arn   # report dropped batches here
